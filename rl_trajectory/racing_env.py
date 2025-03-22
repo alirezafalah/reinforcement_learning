@@ -2,8 +2,8 @@ import gym
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from a2rl_bs_msgs.msg import VectornavIns  # Custom message for /a2rl/vn/ins
-from vectornav_msgs.msg import ImuGroup    # Custom message for /vectornav/raw/imu
+from a2rl_bs_msgs.msg import VectornavIns
+from vectornav_msgs.msg import ImuGroup
 from pynput.keyboard import Key, Controller
 import subprocess
 import time
@@ -15,10 +15,10 @@ class RacingEnv(gym.Env, Node):
                  right_bound_csv='rl_trajectory/yasBounds/RightBound.csv'):
         super().__init__('racing_env_node')
         
-        # Action space: [throttle, steering]
-        self.action_space = gym.spaces.Box(low=np.array([0.0, -1.0]), 
-                                          high=np.array([1.0, 1.0]), 
-                                          dtype=np.float32)
+        # Action space: [throttle, steering], each with 3 options
+        # Throttle: 0 (off), 1 (short press), 2 (long press)
+        # Steering: 0 (off), 1 (short left), 2 (short right)
+        self.action_space = gym.spaces.MultiDiscrete([3, 3])
 
         # Observation space: [pos_x, pos_y, pos_z, vel_x, vel_y, vel_z, accel_x, accel_y, accel_z, yaw]
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, 
@@ -29,7 +29,7 @@ class RacingEnv(gym.Env, Node):
         self.imu_sub = self.create_subscription(ImuGroup, '/vectornav/raw/imu', self.imu_callback, 10)
 
         # State variables
-        self.state = np.zeros(10)  # [pos_x, pos_y, pos_z, vel_x, vel_y, vel_z, accel_x, accel_y, accel_z, yaw]
+        self.state = np.zeros(10)
         self.last_position = np.zeros(3)
         self.lap_count = 0
         self.last_lap_time = time.time()
@@ -38,14 +38,12 @@ class RacingEnv(gym.Env, Node):
         # Keyboard controller
         self.keyboard = Controller()
 
-        # Load track bounds from CSVs
+        # Load track bounds
         self.left_bound = pd.read_csv(left_bound_csv, header=None, names=['x', 'y', 'z']).to_numpy()
         self.right_bound = pd.read_csv(right_bound_csv, header=None, names=['x', 'y', 'z']).to_numpy()
 
-        # Yas Marina start/finish line (aligned with simcli --move-track)
+        # Start/finish line
         self.start_finish_line = {'x': -20.0, 'y': -680.0, 'tolerance': 5.0}
-
-        # Track width estimate (Yas Marina is ~12-15m wide)
         self.track_width_threshold = 15.0
 
     def ins_callback(self, msg):
@@ -63,7 +61,6 @@ class RacingEnv(gym.Env, Node):
         self.state[8] = msg.accel.z
 
     def reset(self):
-        # Reset using simcli --reset-to-track
         subprocess.run(["simcli", "--reset-to-track"], check=True)
         self.done = False
         self.lap_count = 0
@@ -79,23 +76,36 @@ class RacingEnv(gym.Env, Node):
     def step(self, action):
         throttle, steering = action
         
-        if throttle > 0.1:  # Forward
+        # Throttle actions
+        if throttle == 1:  # Short accelerate
             self.keyboard.press(Key.up)
-            time.sleep(0.05 * throttle)
+            time.sleep(0.1)  # Light press
             self.keyboard.release(Key.up)
-        elif throttle < -0.1:  # Backward
-            self.keyboard.press(Key.down)
-            time.sleep(0.05 * abs(throttle))
-            self.keyboard.release(Key.down)
+        elif throttle == 2:  # Long accelerate
+            self.keyboard.press(Key.up)
+            time.sleep(0.3)  # Stronger press
+            self.keyboard.release(Key.up)
+        # Note: Down (brake) will be separate to allow combos
 
-        if steering > 0.1:  # Right
-            self.keyboard.press(Key.right)
-            time.sleep(0.05 * steering)
-            self.keyboard.release(Key.right)
-        elif steering < -0.1:  # Left
+        # Steering actions (can happen at the same time as throttle)
+        if steering == 1:  # Short left
             self.keyboard.press(Key.left)
-            time.sleep(0.05 * abs(steering))
+            time.sleep(0.1)
             self.keyboard.release(Key.left)
+        elif steering == 2:  # Short right
+            self.keyboard.press(Key.right)
+            time.sleep(0.1)
+            self.keyboard.release(Key.right)
+
+        # Brake actions (can combine with steering)
+        if throttle == 2 and steering in [0, 1, 2]:  # Long press includes braking option
+            self.keyboard.press(Key.down)
+            time.sleep(0.3)  # Stronger brake
+            self.keyboard.release(Key.down)
+        elif throttle == 1 and steering in [0, 1, 2]:  # Short brake if no accel
+            self.keyboard.press(Key.down)
+            time.sleep(0.1)  # Light brake
+            self.keyboard.release(Key.down)
 
         rclpy.spin_once(self, timeout_sec=0.1)
         reward = self._compute_reward()
@@ -110,7 +120,6 @@ class RacingEnv(gym.Env, Node):
         start_pos = np.array([self.start_finish_line['x'], self.start_finish_line['y']])
         dist_to_start = np.linalg.norm(current_pos - start_pos)
 
-        # Lap completion
         if dist_to_start < self.start_finish_line['tolerance']:
             if self.lap_count == 0 or time.time() - self.last_lap_time > 5.0:
                 lap_time = time.time() - self.last_lap_time
@@ -119,14 +128,12 @@ class RacingEnv(gym.Env, Node):
                     self.lap_count += 1
                     self.last_lap_time = time.time()
 
-        # Forward progress
         speed = np.sqrt(self.state[3]**2 + self.state[4]**2)
         reward += speed * 0.1
 
-        # Penalties
         if self._is_off_track():
             reward -= 100.0
-        if self.state[3] < 0:
+        if self.state[3] < 0:  # Still penalize if somehow moving backward
             reward -= 50.0
         if abs(self.state[7]) > 5.0:
             reward -= 20.0
@@ -142,11 +149,8 @@ class RacingEnv(gym.Env, Node):
         current_pos = self.state[:2]
         dist_to_left = np.min(distance.cdist([current_pos], self.left_bound[:, :2]))
         dist_to_right = np.min(distance.cdist([current_pos], self.right_bound[:, :2]))
-
-        # Car is off-track if too far from both boundaries (beyond track width)
         return dist_to_left > self.track_width_threshold and dist_to_right > self.track_width_threshold
 
-# Test the environment
 if __name__ == "__main__":
     rclpy.init()
     env = RacingEnv()
